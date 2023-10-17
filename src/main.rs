@@ -6,7 +6,7 @@
     clippy::unnecessary_wraps
 )]
 
-use anyhow::{anyhow, Result, Ok};
+use anyhow::{anyhow, Result};
 use thiserror::Error;
 use log::*;
 use winit::{
@@ -23,12 +23,20 @@ use vulkanalia::{
     Version,
     vk::{ApplicationInfo, ExtDebugUtilsExtension, KhrSurfaceExtension, KhrSwapchainExtension, BlendFactor},
 };
-
 use std::{
     collections::HashSet,
     ffi::CStr,
-    os::raw::c_void
+    os::raw::c_void,
+    mem::size_of,
+    ptr::copy_nonoverlapping as memcpy,
 };
+use cgmath::{
+    vec2,
+    vec3
+};
+
+type Vec2 = cgmath::Vector2<f32>;
+type Vec3 = cgmath::Vector3<f32>;
 
 const PORTABILITY_MACOS_VERSION: Version = Version::new(1, 3, 216);
 
@@ -49,15 +57,25 @@ fn main() -> Result<()> {
     // App
     let mut app = unsafe { App::create(&window).unwrap() };
     let mut destroying = false;
+    let mut minimized = false;
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
         match event {
-            Event::MainEventsCleared if !destroying => unsafe { app.render(&window) }.unwrap(),
+            Event::MainEventsCleared if !destroying && !minimized => unsafe { app.render(&window) }.unwrap(),
             Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => {
                 destroying = true;
                 *control_flow = ControlFlow::Exit;
                 unsafe { app.device.device_wait_idle().unwrap(); }
                 unsafe { app.destroy(); }
+            },
+            Event::WindowEvent { event: WindowEvent::Resized(size), .. } => {
+                if size.width == 0 || size.height == 0 {
+                    minimized = true;
+                } else {
+                    minimized = false;
+                    app.resized = true;
+                }
+
             }
             _ => {}
         }
@@ -264,6 +282,53 @@ unsafe fn create_logical_device(
     Ok(device)
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct Vertex {
+    pos: Vec2,
+    color: Vec3,
+}
+
+impl Vertex {
+    const fn new(pos: Vec2, color: Vec3) -> Self {
+        Self {
+            pos,
+            color
+        }
+    }
+
+    fn binding_description() -> vk::VertexInputBindingDescription {
+        vk::VertexInputBindingDescription::builder()
+            .binding(0)
+            .stride(size_of::<Vertex>() as u32)
+            .input_rate(vk::VertexInputRate::VERTEX)
+            .build()
+    }
+
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        let pos = vk::VertexInputAttributeDescription::builder()
+            .binding(0)
+            .location(0)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset(0)
+            .build();
+        let color = vk::VertexInputAttributeDescription::builder()
+            .binding(0)
+            .location(1)
+            .format(vk::Format::R32G32B32_SFLOAT)
+            .offset(size_of::<Vec2>() as u32)
+            .build();
+
+        [pos, color]
+    }
+}
+
+static VERTICES: [Vertex; 3] = [
+    Vertex::new(vec2(0.0, -0.5), vec3(1.0, 0.0, 0.0)),
+    Vertex::new(vec2(0.5, 0.5), vec3(0.0, 1.0, 0.0)),
+    Vertex::new(vec2(-0.5, 0.5), vec3(0.0, 0.0, 1.0)),
+];
+
 #[derive(Clone, Debug)]
 struct App {
     entry: Entry,
@@ -271,6 +336,7 @@ struct App {
     data: AppData,
     device: Device,
     frame: usize,
+    resized: bool,
 }
 
 impl App {
@@ -288,10 +354,11 @@ impl App {
         create_pipeline(&device, &mut data).unwrap();
         create_framebuffers(&device, &mut data).unwrap();
         create_command_pool(&instance, &device, &mut data).unwrap();
+        create_vertex_buffer(&instance, &device, &mut data).unwrap();
         create_command_buffers(&device, &mut data).unwrap();
         create_sync_objects(&device, &mut data).unwrap();
         Ok(
-            Self { entry, instance, data, device, frame: 0 }
+            Self { entry, instance, data, device, frame: 0, resized: false }
         )
     }
 
@@ -301,7 +368,6 @@ impl App {
             true, 
             u64::MAX
         ).unwrap();
-
 
         let image_index = self.device
             .acquire_next_image_khr(
@@ -347,15 +413,42 @@ impl App {
             .wait_semaphores(signal_semaphores)
             .swapchains(swapchains)
             .image_indices(image_indices);
+        
+        let result = self.device.queue_present_khr(self.data.present_queue, &present_info);
+        let changed = result == Ok(vk::SuccessCode::SUBOPTIMAL_KHR) || result == Err(vk::ErrorCode::OUT_OF_DATE_KHR);
 
-        self.device.queue_present_khr(self.data.present_queue, &present_info).unwrap();
+        if self.resized || changed {
+            self.resized = false;
+            self.recreate_swapchain(window).unwrap();
+        } else if let Err(e) = result {
+            return Err(anyhow!(e));
+        }
         self.device.queue_wait_idle(self.data.present_queue).unwrap();
 
         self.frame = (self.frame + 1) % MAX_FRAMES_IN_FLIGHT;
         Ok(())
     }
 
+    unsafe fn recreate_swapchain(&mut self, window: &Window) -> Result<()> {
+        self.device.device_wait_idle().unwrap();
+        self.destroy_swapchain();
+        create_swapchain(window, &self.instance, &self.device, &mut self.data).unwrap();
+        create_swapchain_image_views(&self.device, &mut self.data).unwrap();
+        create_render_pass(&self.instance, &self.device, &mut self.data).unwrap();
+        create_pipeline(&self.device, &mut self.data).unwrap();
+        create_framebuffers(&self.device, &mut self.data).unwrap();
+        create_command_buffers(&self.device, &mut self.data).unwrap();
+        self.data
+            .images_in_flight
+            .resize(self.data.swapchain_images.len(), vk::Fence::null());
+        Ok(())
+    }
+
     unsafe fn destroy(&mut self) {
+        self.destroy_swapchain();
+
+        self.device.destroy_buffer(self.data.vertex_buffer, None);
+        self.device.free_memory(self.data.vertex_buffer_memory, None);
         self.data.in_flight_fences
             .iter()
             .for_each(|f| self.device.destroy_fence(*f, None));
@@ -364,12 +457,6 @@ impl App {
         self.data.image_available_semaphore.iter()
             .for_each(|s| self.device.destroy_semaphore(*s, None));
         self.device.destroy_command_pool(self.data.command_pool, None);
-        self.data.framebuffers.iter().for_each(|f| self.device.destroy_framebuffer(*f, None));
-        self.device.destroy_pipeline(self.data.pipeline, None);
-        self.device.destroy_pipeline_layout(self.data.pipeline_layout, None);
-        self.device.destroy_render_pass(self.data.render_pass, None);
-        self.data.swapchain_image_views.iter().for_each(|v| self.device.destroy_image_view(*v, None));
-        self.device.destroy_swapchain_khr(self.data.swapchain, None);
         self.device.destroy_device(None);
 
         if VALIDATION_ENABLED {
@@ -378,6 +465,16 @@ impl App {
 
         self.instance.destroy_surface_khr(self.data.surface, None);
         self.instance.destroy_instance(None);
+    }
+
+    unsafe fn destroy_swapchain(&mut self) {
+        self.data.framebuffers.iter().for_each(|f| self.device.destroy_framebuffer(*f, None));
+        self.device.free_command_buffers(self.data.command_pool, &self.data.command_buffers);
+        self.device.destroy_pipeline(self.data.pipeline, None);
+        self.device.destroy_pipeline_layout(self.data.pipeline_layout, None);
+        self.device.destroy_render_pass(self.data.render_pass, None);
+        self.data.swapchain_image_views.iter().for_each(|v| self.device.destroy_image_view(*v, None));
+        self.device.destroy_swapchain_khr(self.data.swapchain, None);
     }
 }
 
@@ -403,6 +500,8 @@ struct AppData {
     render_finished_semaphore: Vec<vk::Semaphore>,
     in_flight_fences: Vec<vk::Fence>,
     images_in_flight: Vec<vk::Fence>,
+    vertex_buffer: vk::Buffer,
+    vertex_buffer_memory: vk::DeviceMemory,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -615,7 +714,11 @@ unsafe fn create_pipeline(
         .module(frag_shader_module)
         .name(b"main\0");
 
-    let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder();
+    let binding_descriptions = &[Vertex::binding_description()];
+    let attribute_descriptions = Vertex::attribute_descriptions();
+    let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::builder()
+        .vertex_binding_descriptions(binding_descriptions)
+        .vertex_attribute_descriptions(&attribute_descriptions);
 
     let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::builder()
         .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
@@ -837,9 +940,10 @@ unsafe fn create_command_buffers(
             data.pipeline
         );
 
+        device.cmd_bind_vertex_buffers(*command_buffer, 0, &[data.vertex_buffer], &[0]);
         device.cmd_draw(
             *command_buffer,
-            3,
+            VERTICES.len() as u32,
             1,
             0,
             0
@@ -878,5 +982,56 @@ unsafe fn create_sync_objects(
     Ok(())
 }
 
+unsafe fn create_vertex_buffer(
+    instance: &Instance,
+    device: &Device,
+    data: &mut AppData,
+) -> Result<()> {
+    let buffer_info = vk::BufferCreateInfo::builder()
+        .size((size_of::<Vertex>() * VERTICES.len()) as u64)
+        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+        .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
+    data.vertex_buffer = device.create_buffer(&buffer_info, None).unwrap();
 
+    let requirements = device.get_buffer_memory_requirements(data.vertex_buffer);
+    let memory_info = vk::MemoryAllocateInfo::builder()
+        .allocation_size(requirements.size)
+        .memory_type_index(get_memory_type_index(
+            instance, 
+            data, 
+            vk::MemoryPropertyFlags::HOST_COHERENT | vk::MemoryPropertyFlags::HOST_VISIBLE, 
+            requirements).unwrap());
+
+    data.vertex_buffer_memory = device.allocate_memory(&memory_info, None).unwrap();
+
+    device.bind_buffer_memory(data.vertex_buffer, data.vertex_buffer_memory, 0).unwrap();
+
+    let memory = device.map_memory(
+        data.vertex_buffer_memory, 
+        0, 
+        buffer_info.size, 
+        vk::MemoryMapFlags::empty()).unwrap();
+
+    memcpy(VERTICES.as_ptr(), memory.cast(), VERTICES.len());
+    device.unmap_memory(data.vertex_buffer_memory);
+
+    Ok(())
+}
+
+unsafe fn get_memory_type_index (
+    instance: &Instance,
+    data: &AppData,
+    properties: vk::MemoryPropertyFlags,
+    requirements: vk::MemoryRequirements,
+) -> Result<u32> {
+    let memory = instance.get_physical_device_memory_properties(data.physical_device);
+
+    (0..memory.memory_type_count)
+        .find(|i| {
+            let suitable = (requirements.memory_type_bits & (1 << i)) != 0;
+            let memory_type = memory.memory_types[*i as usize];
+            suitable && memory_type.property_flags.contains(properties)
+        })
+        .ok_or_else(|| anyhow!("Failed to find suitable memory type."))
+}
