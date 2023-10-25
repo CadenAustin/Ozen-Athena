@@ -199,6 +199,11 @@ unsafe fn check_physical_device(
         return Err(anyhow!(SutibilityError("Insufficient Swapchain Support")));
     }
 
+    let features = instance.get_physical_device_features(physical_device);
+    if features.sampler_anisotropy != vk::TRUE {
+        return Err(anyhow!(SutibilityError("No sampler anisotropy.")));
+    }
+
     Ok(())
 }
 
@@ -271,7 +276,8 @@ unsafe fn create_logical_device(
         extensions.push(vk::KHR_PORTABILITY_SUBSET_EXTENSION.name.as_ptr());
     }
 
-    let features = vk::PhysicalDeviceFeatures::builder();
+    let features = vk::PhysicalDeviceFeatures::builder()
+        .sampler_anisotropy(true);
 
     let info = vk::DeviceCreateInfo::builder()
         .queue_create_infos(&queue_infos)
@@ -290,15 +296,17 @@ unsafe fn create_logical_device(
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct Vertex {
-    pos: Vec2,
+    pos: Vec3,
     color: Vec3,
+    tex_coords: Vec2
 }
 
 impl Vertex {
-    const fn new(pos: Vec2, color: Vec3) -> Self {
+    const fn new(pos: Vec3, color: Vec3, tex_coords: Vec2) -> Self {
         Self {
             pos,
-            color
+            color,
+            tex_coords
         }
     }
 
@@ -310,11 +318,11 @@ impl Vertex {
             .build()
     }
 
-    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+    fn attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
         let pos = vk::VertexInputAttributeDescription::builder()
             .binding(0)
             .location(0)
-            .format(vk::Format::R32G32_SFLOAT)
+            .format(vk::Format::R32G32B32_SFLOAT)
             .offset(0)
             .build();
         let color = vk::VertexInputAttributeDescription::builder()
@@ -323,19 +331,32 @@ impl Vertex {
             .format(vk::Format::R32G32B32_SFLOAT)
             .offset(size_of::<Vec2>() as u32)
             .build();
+        let tex_coord = vk::VertexInputAttributeDescription::builder()
+            .binding(0)
+            .location(2)
+            .format(vk::Format::R32G32_SFLOAT)
+            .offset((size_of::<Vec2>() + size_of::<Vec3>()) as u32)
+            .build();
 
-        [pos, color]
+        [pos, color, tex_coord]
     }
 }
 
-static VERTICES: [Vertex; 4] = [
-    Vertex::new(vec2(-0.5, -0.5), vec3(1.0, 0.0, 0.0)),
-    Vertex::new(vec2(0.5, -0.5), vec3(0.0, 1.0, 0.0)),
-    Vertex::new(vec2(0.5, 0.5), vec3(0.0, 0.0, 1.0)),
-    Vertex::new(vec2(-0.5, 0.5), vec3(1.0, 1.0, 1.0)),
+static VERTICES: [Vertex; 8] = [
+    Vertex::new(vec3(-0.5, -0.5, 0.0), vec3(1.0, 0.0, 0.0), vec2(1.0, 0.0)),
+    Vertex::new(vec3(0.5, -0.5, 0.0), vec3(0.0, 1.0, 0.0), vec2(0.0, 0.0)),
+    Vertex::new(vec3(0.5, 0.5, 0.0), vec3(0.0, 0.0, 1.0), vec2(0.0, 1.0)),
+    Vertex::new(vec3(-0.5, 0.5, 0.0), vec3(1.0, 1.0, 1.0), vec2(1.0, 1.0)),
+    Vertex::new(vec3(-0.5, -0.5, -0.5), vec3(1.0, 0.0, 0.0), vec2(1.0, 0.0)),
+    Vertex::new(vec3(0.5, -0.5, -0.5), vec3(0.0, 1.0, 0.0), vec2(0.0, 0.0)),
+    Vertex::new(vec3(0.5, 0.5, -0.5), vec3(0.0, 0.0, 1.0), vec2(0.0, 1.0)),
+    Vertex::new(vec3(-0.5, 0.5, -0.5), vec3(1.0, 1.0, 1.0), vec2(1.0, 1.0)),
 ];
 
-const INDICES: &[u16] = &[0, 1, 2, 2, 3, 0];
+const INDICES: &[u16] = &[
+    0, 1, 2, 2, 3, 0,
+    4, 5, 6, 6, 7, 4,
+];
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
@@ -372,7 +393,10 @@ impl App {
         create_pipeline(&device, &mut data).unwrap();
         create_framebuffers(&device, &mut data).unwrap();
         create_command_pool(&instance, &device, &mut data).unwrap();
+        create_depth_objects(&instance, &device, &mut data).unwrap();
         create_texture_image(&instance, &device, &mut data).unwrap();
+        create_texture_image_view(&device, &mut data).unwrap();
+        create_texture_sampler(&device, &mut data).unwrap();
         create_vertex_buffer(&instance, &device, &mut data).unwrap();
         create_index_buffer(&instance, &device, &mut data).unwrap();
         create_uniform_buffers(&instance, &device, &mut data).unwrap();
@@ -467,7 +491,14 @@ impl App {
             vec3(0.0, 0.0, 1.0),
         );
 
-        let mut proj = cgmath::perspective(
+        let correction = Mat4::new(
+            1.0, 0.0, 0.0, 0.0,
+            0.0, -1.0, 0.0, 0.0,
+            0.0, 0.0, 1.0 / 2.0, 0.0,
+            0.0, 0.0, 1.0 / 2.0, 1.0,
+        );
+
+        let mut proj = correction * cgmath::perspective(
             Deg(45.0),
             self.data.swapchain_extent.width as f32 / self.data.swapchain_extent.height as f32, 
             0.1, 
@@ -512,6 +543,8 @@ impl App {
 
     unsafe fn destroy(&mut self) {
         self.destroy_swapchain();   
+        self.device.destroy_sampler(self.data.texture_sampler, None);
+        self.device.destroy_image_view(self.data.texture_image_view, None);
         self.device.destroy_image(self.data.texture_image, None);
         self.device.free_memory(self.data.texture_image_memory, None);
         self.device.destroy_descriptor_set_layout(self.data.descriptor_set_layout, None);
@@ -588,6 +621,11 @@ struct AppData {
     descriptor_sets: Vec<vk::DescriptorSet>,
     texture_image: vk::Image,
     texture_image_memory: vk::DeviceMemory,
+    texture_image_view: vk::ImageView,
+    texture_sampler: vk::Sampler,
+    depth_image: vk::Image,
+    depth_image_memory: vk::DeviceMemory,
+    depth_image_view: vk::ImageView,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -753,30 +791,11 @@ unsafe fn create_swapchain_image_views(
     device: &Device,
     data: &mut AppData
 ) -> Result<()> {
-    data.swapchain_image_views = data.swapchain_images.iter().map(|i| {
-        let components = vk::ComponentMapping::builder()
-            .r(vk::ComponentSwizzle::IDENTITY)
-            .g(vk::ComponentSwizzle::IDENTITY)
-            .b(vk::ComponentSwizzle::IDENTITY)
-            .a(vk::ComponentSwizzle::IDENTITY);
-
-        let subresource_range = vk::ImageSubresourceRange::builder()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .base_mip_level(0)
-            .level_count(1)
-            .base_array_layer(0)
-            .layer_count(1);
-
-        let info = vk::ImageViewCreateInfo::builder()
-            .image(*i)
-            .view_type(vk::ImageViewType::_2D)
-            .format(data.swapchain_format)
-            .components(components)
-            .subresource_range(subresource_range);
-
-        device.create_image_view(&info, None)
-    })
-    .collect::<Result<Vec<_>, _>>().unwrap();
+    data.swapchain_image_views = data
+        .swapchain_images
+        .iter()
+        .map(|i| create_image_view(device, *i, data.swapchain_format, vk::ImageAspectFlags::COLOR))
+        .collect::<Result<Vec<_>, _>>().unwrap();
     Ok(())
 }
 
@@ -1254,7 +1273,13 @@ unsafe fn create_description_set_layout(
         .descriptor_count(1)
         .stage_flags(vk::ShaderStageFlags::VERTEX);
 
-    let bindings = &[ubo_binding];
+    let sampler_binding = vk::DescriptorSetLayoutBinding::builder()
+        .binding(1)
+        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(1)
+        .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+
+    let bindings = &[ubo_binding, sampler_binding];
     let info = vk::DescriptorSetLayoutCreateInfo::builder()
         .bindings(bindings);
 
@@ -1296,7 +1321,11 @@ unsafe fn create_descriptor_pool(
         .type_(vk::DescriptorType::UNIFORM_BUFFER)
         .descriptor_count(data.swapchain_images.len() as u32);
 
-    let pool_sizes = &[ubo_size];
+    let sampler_size = vk::DescriptorPoolSize::builder()
+        .type_(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+        .descriptor_count(data.swapchain_images.len() as u32);
+
+    let pool_sizes = &[ubo_size, sampler_size];
     let info = vk::DescriptorPoolCreateInfo::builder()
         .pool_sizes(pool_sizes)
         .max_sets(data.swapchain_images.len() as u32);
@@ -1330,7 +1359,20 @@ unsafe fn create_descriptor_sets(
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(buffer_info);
 
-        device.update_descriptor_sets(&[ubo_write], &[] as &[vk::CopyDescriptorSet]);
+        let info = vk::DescriptorImageInfo::builder()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(data.texture_image_view)
+            .sampler(data.texture_sampler);
+
+        let image_info = &[info];
+        let sampler_write = vk::WriteDescriptorSet::builder()
+            .dst_set(data.descriptor_sets[i])
+            .dst_binding(1)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .image_info(image_info);
+
+        device.update_descriptor_sets(&[ubo_write, sampler_write], &[] as &[vk::CopyDescriptorSet]);
     }
     Ok(())
 }
@@ -1607,4 +1649,126 @@ unsafe fn copy_buffer_to_image(
     end_single_time_commands(device, data, command_buffer)?;
 
     Ok(())
+}
+
+unsafe fn create_image_view(device: &Device, image: vk::Image, format: vk::Format, aspects: vk::ImageAspectFlags) -> Result<vk::ImageView> {
+    let subresource_range = vk::ImageSubresourceRange::builder()
+        .aspect_mask(aspects)
+        .base_mip_level(0)
+        .level_count(1)
+        .base_array_layer(0)
+        .layer_count(1);
+
+    let info = vk::ImageViewCreateInfo::builder()
+        .image(image)
+        .view_type(vk::ImageViewType::_2D)
+        .format(format)
+        .subresource_range(subresource_range);
+
+    Ok(device.create_image_view(&info, None).unwrap())
+}
+
+unsafe fn create_texture_image_view(
+    device: &Device,
+    data: &mut AppData
+) -> Result<()> {
+    data.texture_image_view = create_image_view(
+        device, 
+        data.texture_image, 
+        vk::Format::R8G8B8A8_SRGB,
+        vk::ImageAspectFlags::COLOR
+    ).unwrap();
+    Ok(())
+}
+
+unsafe fn create_texture_sampler(device: &Device, data: &mut AppData) -> Result<()> {
+    let info = vk::SamplerCreateInfo::builder()
+        .mag_filter(vk::Filter::LINEAR)
+        .min_filter(vk::Filter::LINEAR)
+        .address_mode_u(vk::SamplerAddressMode::REPEAT)
+        .address_mode_v(vk::SamplerAddressMode::REPEAT)
+        .address_mode_w(vk::SamplerAddressMode::REPEAT)
+        .anisotropy_enable(true)
+        .max_anisotropy(16.0)
+        .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+        .unnormalized_coordinates(false)
+        .compare_enable(false)
+        .compare_op(vk::CompareOp::ALWAYS)
+        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+        .mip_lod_bias(0.0)
+        .min_lod(0.0)
+        .max_lod(0.0);
+
+    data.texture_sampler = device.create_sampler(&info, None).unwrap();
+
+    Ok(())
+}
+
+unsafe fn create_depth_objects(
+    instance: &Instance,
+    device: &Device,
+    data: &mut AppData
+) -> Result<()> {
+    let format = get_depth_format(instance, data).unwrap();
+    let (depth_image, depth_image_memory) = create_image(
+        instance,
+        device,
+        data,
+        data.swapchain_extent.width,
+        data.swapchain_extent.height,
+        format,
+        vk::ImageTiling::OPTIMAL,
+        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    ).unwrap();
+
+    data.depth_image = depth_image;
+    data.depth_image_memory = depth_image_memory;
+
+    data.depth_image_view = create_image_view(device, data.depth_image, format, vk::ImageAspectFlags::DEPTH).unwrap();
+
+    transition_image_layout(device, data, data.depth_image, format, vk::ImageLayout::UNDEFINED, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL).unwrap();
+    Ok(())
+}
+
+unsafe fn get_depth_format(instance: &Instance, data: &AppData) -> Result<vk::Format> {
+    let candidates = &[
+        vk::Format::D32_SFLOAT,
+        vk::Format::D32_SFLOAT_S8_UINT,
+        vk::Format::D24_UNORM_S8_UINT,
+    ];
+
+    get_supported_format(
+        instance, 
+        data, 
+        candidates, 
+        vk::ImageTiling::OPTIMAL, 
+        vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT
+    )
+}
+
+unsafe fn get_supported_format(
+    instance: &Instance,
+    data: &AppData,
+    candidates: &[vk::Format],
+    tiling: vk::ImageTiling,
+    features: vk::FormatFeatureFlags,
+) -> Result<vk::Format> {
+    candidates
+        .iter()
+        .cloned()
+        .find(|f| {
+            let properties = instance.get_physical_device_format_properties(
+                data.physical_device,
+                *f,
+            );
+
+            match tiling {
+                vk::ImageTiling::LINEAR => properties.linear_tiling_features.contains(features),
+                vk::ImageTiling::OPTIMAL => properties.optimal_tiling_features.contains(features),
+                _ => false,
+            }
+
+        })
+        .ok_or_else(|| anyhow!("Failed to find supported format!"))
 }
