@@ -34,7 +34,7 @@ use vulkanalia::{
 };
 use winit::{
     dpi::LogicalSize,
-    event::{ElementState, Event, VirtualKeyCode, WindowEvent},
+    event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::{Window, WindowBuilder},
 };
@@ -96,18 +96,6 @@ fn main() -> Result<()> {
                 } else {
                     minimized = false;
                     app.resized = true;
-                }
-            }
-            Event::WindowEvent {
-                event: WindowEvent::KeyboardInput { input, .. },
-                ..
-            } => {
-                if input.state == ElementState::Pressed {
-                    match input.virtual_keycode {
-                        Some(VirtualKeyCode::Left) if app.models > 1 => app.models -= 1,
-                        Some(VirtualKeyCode::Right) if app.models < 4 => app.models += 1,
-                        _ => {}
-                    }
                 }
             }
             _ => {}
@@ -597,20 +585,18 @@ impl App {
     }
 
     unsafe fn update_command_buffer(&mut self, image_index: usize) -> Result<()> {
-        // Reset
-
         let command_pool = self.data.command_pools[image_index];
         self.device
-            .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())?;
+            .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
+            .unwrap();
 
         let command_buffer = self.data.command_buffers[image_index];
 
-        // Commands
-
         let info = vk::CommandBufferBeginInfo::builder()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-
-        self.device.begin_command_buffer(command_buffer, &info)?;
+        self.device
+            .begin_command_buffer(command_buffer, &info)
+            .unwrap();
 
         let render_area = vk::Rect2D::builder()
             .offset(vk::Offset2D::default())
@@ -642,15 +628,17 @@ impl App {
             vk::SubpassContents::SECONDARY_COMMAND_BUFFERS,
         );
 
-        let secondary_command_buffers = (0..self.models)
+        let secondary_command_buffer = (0..self.models)
             .map(|i| self.update_secondary_command_buffer(image_index, i))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
         self.device
-            .cmd_execute_commands(command_buffer, &secondary_command_buffers[..]);
+            .cmd_execute_commands(command_buffer, &secondary_command_buffer[..]);
 
         self.device.cmd_end_render_pass(command_buffer);
 
-        self.device.end_command_buffer(command_buffer)?;
+        self.device.end_command_buffer(command_buffer).unwrap();
 
         Ok(())
     }
@@ -660,39 +648,35 @@ impl App {
         image_index: usize,
         model_index: usize,
     ) -> Result<vk::CommandBuffer> {
-        // Allocate
-
+        
         let command_buffers = &mut self.data.secondary_command_buffers[image_index];
+
         while model_index >= command_buffers.len() {
             let allocate_info = vk::CommandBufferAllocateInfo::builder()
                 .command_pool(self.data.command_pools[image_index])
                 .level(vk::CommandBufferLevel::SECONDARY)
                 .command_buffer_count(1);
 
-            let command_buffer = self.device.allocate_command_buffers(&allocate_info)?[0];
+            let command_buffer = self
+                .device
+                .allocate_command_buffers(&allocate_info)
+                .unwrap()[0];
             command_buffers.push(command_buffer);
         }
 
         let command_buffer = command_buffers[model_index];
 
-        // Model
-
         let y = (((model_index % 2) as f32) * 2.5) - 1.25;
         let z = (((model_index / 2) as f32) * -2.0) + 1.0;
-
         let time = self.start.elapsed().as_secs_f32();
 
-        let model = Mat4::from_translation(vec3(0.0, y, z)) * Mat4::from_axis_angle(
-            vec3(0.0, 0.0, 1.0),
-            Deg(90.0) * time
-        );
+        let model = Mat4::from_translation(vec3(0.0, y, z))
+            * Mat4::from_axis_angle(vec3(0.0, 0.0, 1.0), Deg(90.0) * time);
 
-        let model_bytes = std::slice::from_raw_parts(&model as *const Mat4 as *const u8, size_of::<Mat4>());
+        let model_bytes = from_raw_parts(&model as *const Mat4 as *const u8, size_of::<Mat4>());
 
         let opacity = (model_index + 1) as f32 * 0.25;
         let opacity_bytes = &opacity.to_ne_bytes()[..];
-
-        // Commands
 
         let inheritance_info = vk::CommandBufferInheritanceInfo::builder()
             .render_pass(self.data.render_pass)
@@ -703,11 +687,23 @@ impl App {
             .flags(vk::CommandBufferUsageFlags::RENDER_PASS_CONTINUE)
             .inheritance_info(&inheritance_info);
 
-        self.device.begin_command_buffer(command_buffer, &info)?;
+        self.device
+            .begin_command_buffer(command_buffer, &info)
+            .unwrap();
 
-        self.device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, self.data.pipeline);
-        self.device.cmd_bind_vertex_buffers(command_buffer, 0, &[self.data.vertex_buffer], &[0]);
-        self.device.cmd_bind_index_buffer(command_buffer, self.data.index_buffer, 0, vk::IndexType::UINT32);
+        self.device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.data.pipeline,
+        );
+        self.device
+            .cmd_bind_vertex_buffers(command_buffer, 0, &[self.data.vertex_buffer], &[0]);
+        self.device.cmd_bind_index_buffer(
+            command_buffer,
+            self.data.index_buffer,
+            0,
+            vk::IndexType::UINT32,
+        );
         self.device.cmd_bind_descriptor_sets(
             command_buffer,
             vk::PipelineBindPoint::GRAPHICS,
@@ -730,9 +726,10 @@ impl App {
             64,
             opacity_bytes,
         );
-        self.device.cmd_draw_indexed(command_buffer, self.data.indices.len() as u32, 1, 0, 0, 0);
+        self.device
+            .cmd_draw_indexed(command_buffer, self.data.indices.len() as u32, 1, 0, 0, 0);
 
-        self.device.end_command_buffer(command_buffer)?;
+        self.device.end_command_buffer(command_buffer).unwrap();
 
         Ok(command_buffer)
     }
@@ -784,8 +781,7 @@ impl App {
             .free_memory(self.data.vertex_buffer_memory, None);
         self.device.destroy_buffer(self.data.vertex_buffer, None);
         self.device.destroy_sampler(self.data.texture_sampler, None);
-        self.device
-            .destroy_image_view(self.data.texture_image_view, None);
+        self.device.destroy_image_view(self.data.texture_image_view, None);
         self.device
             .free_memory(self.data.texture_image_memory, None);
         self.device.destroy_image(self.data.texture_image, None);
@@ -1316,15 +1312,12 @@ unsafe fn create_command_pools(
     device: &Device,
     data: &mut AppData,
 ) -> Result<()> {
-    // Global
-
-    data.command_pool = create_command_pool(instance, device, data)?;
-
-    // Per-framebuffer
+    data.command_pool = create_command_pool(instance, device, data).unwrap();
 
     let num_images = data.swapchain_images.len();
+
     for _ in 0..num_images {
-        let command_pool = create_command_pool(instance, device, data)?;
+        let command_pool = create_command_pool(instance, device, data).unwrap();
         data.command_pools.push(command_pool);
     }
 
@@ -1336,13 +1329,13 @@ unsafe fn create_command_pool(
     device: &Device,
     data: &mut AppData,
 ) -> Result<vk::CommandPool> {
-    let indices = QueueFamilyIndices::get(instance, data, data.physical_device)?;
+    let indices = QueueFamilyIndices::get(instance, data, data.physical_device).unwrap();
 
     let info = vk::CommandPoolCreateInfo::builder()
         .flags(vk::CommandPoolCreateFlags::TRANSIENT)
         .queue_family_index(indices.graphics);
 
-    Ok(device.create_command_pool(&info, None)?)
+    Ok(device.create_command_pool(&info, None).unwrap())
 }
 
 unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<()> {
@@ -1353,7 +1346,7 @@ unsafe fn create_command_buffers(device: &Device, data: &mut AppData) -> Result<
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
 
-        let command_buffer = device.allocate_command_buffers(&allocate_info)?[0];
+        let command_buffer = device.allocate_command_buffers(&allocate_info).unwrap()[0];
         data.command_buffers.push(command_buffer);
     }
 
